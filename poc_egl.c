@@ -9,7 +9,8 @@
  *
  * What this shows:
  *   BUG:  eglGetDisplay(EGL_DEFAULT_DISPLAY) via GLVND → Mesa → llvmpipe (CPU)
- *   FIX:  eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, nvidia_device) → GPU
+ *   FIX:  eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_display) → GPU
+ *         (Option A fix: explicit platform + display pointer, one-line change)
  *
  * The vendor ICD libraries (libEGL_mesa.so.0, libEGL_nvidia.so.0) do NOT export
  * standard egl* symbols — they use GLVND's internal dispatch table. You cannot
@@ -18,7 +19,7 @@
  *
  * Root cause: EGL_DEFAULT_DISPLAY + X11 platform → GLVND routes to Mesa.
  * Mesa has no DRI2/DRI3 driver for nvidia.ko → silent fallback to llvmpipe.
- * Nvidia's EGL ICD requires an explicit Wayland or device platform handle.
+ * Nvidia's EGL ICD requires an explicit platform handle to accept the display.
  */
 
 #include <stdio.h>
@@ -30,9 +31,7 @@ typedef void*          EGLDisplay;
 typedef void*          EGLConfig;
 typedef void*          EGLContext;
 typedef void*          EGLSurface;
-typedef void*          EGLDeviceEXT;
 typedef int            EGLint;
-typedef long           EGLAttrib;
 typedef unsigned int   EGLBoolean;
 typedef unsigned int   EGLenum;
 typedef void*          EGLNativeDisplayType;
@@ -55,27 +54,27 @@ typedef void*          EGLNativeDisplayType;
 #define GL_RENDERER                 0x1F01
 #define GL_VENDOR                   0x1F00
 
-/* EGL_EXT_device_enumeration + EGL_EXT_platform_device */
-#define EGL_PLATFORM_DEVICE_EXT     0x313F
-#define EGL_DRM_DEVICE_FILE_EXT     0x3233
+/* EGL_EXT_platform_base — used by Option A fix */
+#define EGL_PLATFORM_X11_EXT        0x31D5
 
-typedef EGLDisplay   (*fn_eglGetDisplay)         (EGLNativeDisplayType);
-typedef EGLDisplay   (*fn_eglGetPlatformDisplay) (EGLenum, void*, const EGLAttrib*);
-typedef EGLBoolean   (*fn_eglInitialize)         (EGLDisplay, EGLint*, EGLint*);
-typedef EGLBoolean   (*fn_eglBindAPI)            (EGLenum);
-typedef EGLBoolean   (*fn_eglChooseConfig)       (EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
-typedef EGLContext   (*fn_eglCreateContext)      (EGLDisplay, EGLConfig, EGLContext, const EGLint*);
-typedef EGLSurface   (*fn_eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint*);
-typedef EGLBoolean   (*fn_eglMakeCurrent)        (EGLDisplay, EGLSurface, EGLSurface, EGLContext);
-typedef EGLint       (*fn_eglGetError)           (void);
-typedef const char*  (*fn_eglQueryString)        (EGLDisplay, EGLint);
-typedef EGLBoolean   (*fn_eglTerminate)          (EGLDisplay);
-typedef void*        (*fn_eglGetProcAddress)     (const char*);
-typedef const unsigned char* (*fn_glGetString)   (unsigned int);
+typedef void XDisplay;
 
-/* EGL_EXT_device_enumeration */
-typedef EGLBoolean  (*fn_eglQueryDevicesEXT)     (EGLint, EGLDeviceEXT*, EGLint*);
-typedef const char* (*fn_eglQueryDeviceStringEXT)(EGLDeviceEXT, EGLint);
+typedef EGLDisplay   (*fn_eglGetDisplay)            (EGLNativeDisplayType);
+typedef EGLDisplay   (*fn_eglGetPlatformDisplayEXT) (EGLenum, void*, const EGLint*);
+typedef EGLBoolean   (*fn_eglInitialize)            (EGLDisplay, EGLint*, EGLint*);
+typedef EGLBoolean   (*fn_eglBindAPI)               (EGLenum);
+typedef EGLBoolean   (*fn_eglChooseConfig)          (EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
+typedef EGLContext   (*fn_eglCreateContext)         (EGLDisplay, EGLConfig, EGLContext, const EGLint*);
+typedef EGLSurface   (*fn_eglCreatePbufferSurface)  (EGLDisplay, EGLConfig, const EGLint*);
+typedef EGLBoolean   (*fn_eglMakeCurrent)           (EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+typedef EGLint       (*fn_eglGetError)              (void);
+typedef const char*  (*fn_eglQueryString)           (EGLDisplay, EGLint);
+typedef EGLBoolean   (*fn_eglTerminate)             (EGLDisplay);
+typedef void*        (*fn_eglGetProcAddress)        (const char*);
+typedef const unsigned char* (*fn_glGetString)      (unsigned int);
+
+typedef XDisplay*    (*fn_XOpenDisplay)             (const char*);
+typedef int          (*fn_XCloseDisplay)            (XDisplay*);
 
 /* Returns 0=PASS(GPU), 1=SOFTWARE(llvmpipe), 2=FAIL */
 static int check_renderer(fn_eglGetProcAddress eglGetProcAddress,
@@ -178,37 +177,57 @@ static const char* result_label(int r) {
 }
 
 int main(void) {
-    void* lib = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!lib) {
+    void* egl_lib = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!egl_lib) {
         fprintf(stderr, "Cannot load libEGL.so.1: %s\n", dlerror());
         return 1;
     }
 
-    fn_eglGetDisplay         eglGetDisplay         = dlsym(lib, "eglGetDisplay");
-    fn_eglGetPlatformDisplay eglGetPlatformDisplay = dlsym(lib, "eglGetPlatformDisplay");
-    fn_eglInitialize         eglInitialize         = dlsym(lib, "eglInitialize");
-    fn_eglBindAPI            eglBindAPI            = dlsym(lib, "eglBindAPI");
-    fn_eglChooseConfig       eglChooseConfig       = dlsym(lib, "eglChooseConfig");
-    fn_eglCreateContext      eglCreateContext      = dlsym(lib, "eglCreateContext");
-    fn_eglCreatePbufferSurface eglCreatePbufferSurface = dlsym(lib, "eglCreatePbufferSurface");
-    fn_eglMakeCurrent        eglMakeCurrent        = dlsym(lib, "eglMakeCurrent");
-    fn_eglGetError           eglGetError           = dlsym(lib, "eglGetError");
-    fn_eglQueryString        eglQueryString        = dlsym(lib, "eglQueryString");
-    fn_eglTerminate          eglTerminate          = dlsym(lib, "eglTerminate");
-    fn_eglGetProcAddress     eglGetProcAddress     = dlsym(lib, "eglGetProcAddress");
+    void* x11_lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!x11_lib) {
+        fprintf(stderr, "Cannot load libX11.so.6: %s\n", dlerror());
+        dlclose(egl_lib);
+        return 1;
+    }
+
+    fn_eglGetDisplay           eglGetDisplay           = dlsym(egl_lib, "eglGetDisplay");
+    fn_eglInitialize           eglInitialize           = dlsym(egl_lib, "eglInitialize");
+    fn_eglBindAPI              eglBindAPI              = dlsym(egl_lib, "eglBindAPI");
+    fn_eglChooseConfig         eglChooseConfig         = dlsym(egl_lib, "eglChooseConfig");
+    fn_eglCreateContext        eglCreateContext        = dlsym(egl_lib, "eglCreateContext");
+    fn_eglCreatePbufferSurface eglCreatePbufferSurface = dlsym(egl_lib, "eglCreatePbufferSurface");
+    fn_eglMakeCurrent          eglMakeCurrent          = dlsym(egl_lib, "eglMakeCurrent");
+    fn_eglGetError             eglGetError             = dlsym(egl_lib, "eglGetError");
+    fn_eglQueryString          eglQueryString          = dlsym(egl_lib, "eglQueryString");
+    fn_eglTerminate            eglTerminate            = dlsym(egl_lib, "eglTerminate");
+    fn_eglGetProcAddress       eglGetProcAddress       = dlsym(egl_lib, "eglGetProcAddress");
+
+    fn_XOpenDisplay  XOpenDisplay  = dlsym(x11_lib, "XOpenDisplay");
+    fn_XCloseDisplay XCloseDisplay = dlsym(x11_lib, "XCloseDisplay");
 
     if (!eglGetDisplay || !eglInitialize || !eglBindAPI || !eglChooseConfig ||
         !eglCreateContext || !eglCreatePbufferSurface || !eglMakeCurrent ||
         !eglGetError || !eglQueryString || !eglTerminate || !eglGetProcAddress) {
         fprintf(stderr, "Missing required EGL symbols\n");
-        dlclose(lib);
+        dlclose(x11_lib);
+        dlclose(egl_lib);
         return 1;
     }
 
+    if (!XOpenDisplay || !XCloseDisplay) {
+        fprintf(stderr, "Missing required X11 symbols\n");
+        dlclose(x11_lib);
+        dlclose(egl_lib);
+        return 1;
+    }
+
+    fn_eglGetPlatformDisplayEXT eglGetPlatformDisplayEXT =
+        (fn_eglGetPlatformDisplayEXT)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
     /* ------------------------------------------------------------------ */
     printf("=== TEST 1: eglGetDisplay(EGL_DEFAULT_DISPLAY) — the RS3 code path ===\n");
-    printf("This is what RS3/SDL uses. With DISPLAY set (XWayland), GLVND picks\n");
-    printf("the X11 platform and routes to Mesa, which has no DRI2 for nvidia.ko.\n\n");
+    printf("With $DISPLAY set (XWayland active), GLVND picks the X11 platform and\n");
+    printf("routes to Mesa, which has no DRI2/DRI3 driver for nvidia.ko.\n\n");
 
     int result_default = 2;
     {
@@ -226,78 +245,51 @@ int main(void) {
     printf("RESULT: %s\n\n", result_label(result_default));
 
     /* ------------------------------------------------------------------ */
-    printf("=== TEST 2: eglQueryDevicesEXT — enumerate all EGL devices ===\n");
-    printf("This lists every GPU/device GLVND knows about, bypassing platform auto-detection.\n\n");
+    printf("=== TEST 2: eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_display) — Option A fix ===\n");
+    printf("Explicit platform + Display* pointer. GLVND routes by vendor priority:\n");
+    printf("Nvidia (10) beats Mesa (50). x11_display matches what SDL_GetWindowWMInfo provides.\n\n");
 
-    fn_eglQueryDevicesEXT eglQueryDevicesEXT =
-        (fn_eglQueryDevicesEXT)eglGetProcAddress("eglQueryDevicesEXT");
-    fn_eglQueryDeviceStringEXT eglQueryDeviceStringEXT =
-        (fn_eglQueryDeviceStringEXT)eglGetProcAddress("eglQueryDeviceStringEXT");
-
-    int nvidia_device_idx = -1;
-    EGLDeviceEXT devices[32];
-    EGLint num_devices = 0;
-
-    if (!eglQueryDevicesEXT || !eglQueryDeviceStringEXT || !eglGetPlatformDisplay) {
-        printf("  EGL_EXT_device_enumeration or eglGetPlatformDisplay not available\n");
-        printf("  Cannot enumerate devices — Nvidia driver may not support this extension\n\n");
-    } else if (!eglQueryDevicesEXT(32, devices, &num_devices) || num_devices == 0) {
-        printf("  eglQueryDevicesEXT: no devices found (0x%x)\n\n", eglGetError());
+    int result_x11ext = 2;
+    if (!eglGetPlatformDisplayEXT) {
+        printf("  SKIP — eglGetPlatformDisplayEXT not available via eglGetProcAddress\n\n");
     } else {
-        printf("  Found %d EGL device(s):\n", num_devices);
-        for (int i = 0; i < num_devices; i++) {
-            const char* drm_dev = eglQueryDeviceStringEXT(devices[i], EGL_DRM_DEVICE_FILE_EXT);
-            printf("  [%d] DRM device: %s\n", i, drm_dev ? drm_dev : "(none/not a DRM device)");
-            if (drm_dev && nvidia_device_idx < 0) {
-                /* pick first device with a DRM node — on single-GPU systems this is Nvidia */
-                nvidia_device_idx = i;
-            }
-        }
-        printf("\n");
-    }
-
-    /* ------------------------------------------------------------------ */
-    printf("=== TEST 3: eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT) — the fix ===\n");
-    printf("Explicitly targets a specific GPU device, bypassing the X11/Wayland platform\n");
-    printf("auto-detection that routes GLVND to Mesa.\n\n");
-
-    int result_device = 2;
-    if (nvidia_device_idx < 0 || !eglGetPlatformDisplay) {
-        printf("  SKIP — device enumeration unavailable or no devices found\n");
-        printf("  (Nvidia driver < 435 may not support EGL_EXT_device_enumeration)\n\n");
-    } else {
-        EGLDisplay dpy = eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT,
-                                                devices[nvidia_device_idx], NULL);
-        if (dpy == EGL_NO_DISPLAY) {
-            printf("  eglGetPlatformDisplay: FAIL (0x%x)\n\n", eglGetError());
+        XDisplay* x11_dpy = XOpenDisplay(NULL);
+        if (!x11_dpy) {
+            printf("  SKIP — XOpenDisplay(NULL) failed (is $DISPLAY set?)\n\n");
         } else {
-            printf("  eglGetPlatformDisplay: OK (device %d)\n", nvidia_device_idx);
-            result_device = test_display(dpy,
-                eglInitialize, eglBindAPI, eglChooseConfig,
-                eglCreateContext, eglCreatePbufferSurface, eglMakeCurrent,
-                eglGetError, eglQueryString, eglTerminate, eglGetProcAddress);
+            EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_dpy, NULL);
+            if (dpy == EGL_NO_DISPLAY) {
+                printf("  eglGetPlatformDisplayEXT: FAIL (0x%x)\n\n", eglGetError());
+            } else {
+                printf("  eglGetPlatformDisplayEXT: OK\n");
+                result_x11ext = test_display(dpy,
+                    eglInitialize, eglBindAPI, eglChooseConfig,
+                    eglCreateContext, eglCreatePbufferSurface, eglMakeCurrent,
+                    eglGetError, eglQueryString, eglTerminate, eglGetProcAddress);
+            }
+            XCloseDisplay(x11_dpy);
         }
     }
-    printf("RESULT: %s\n\n", result_label(result_device));
+    printf("RESULT: %s\n\n", result_label(result_x11ext));
 
     /* ------------------------------------------------------------------ */
     printf("=== Summary ===\n");
-    printf("  TEST 1 — eglGetDisplay(EGL_DEFAULT_DISPLAY) [RS3 code path]: %s\n", result_label(result_default));
-    printf("  TEST 3 — eglGetPlatformDisplay(DEVICE_EXT)  [proper fix]:    %s\n", result_label(result_device));
+    printf("  TEST 1 — eglGetDisplay(EGL_DEFAULT_DISPLAY)              [RS3 code path]: %s\n", result_label(result_default));
+    printf("  TEST 2 — eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT) [Option A fix]:  %s\n", result_label(result_x11ext));
     printf("\n");
 
-    if (result_default == 1 && result_device == 0) {
-        printf("BUG CONFIRMED: Default EGL dispatch silently falls back to llvmpipe.\n");
-        printf("               Explicit device selection gives hardware rendering.\n");
+    if (result_default == 1 && result_x11ext == 0) {
+        printf("BUG CONFIRMED: Default EGL dispatch falls back to llvmpipe.\n");
+        printf("               Explicit X11 platform selection gives hardware rendering.\n");
         printf("\n");
-        printf("WHY: eglGetDisplay(EGL_DEFAULT_DISPLAY) with DISPLAY set → X11 platform\n");
-        printf("     → GLVND routes to Mesa (handles X11) → Mesa has no DRI2 for nvidia.ko\n");
-        printf("     → Mesa creates llvmpipe context silently, game appears to run but uses CPU\n");
+        printf("WHY: eglGetDisplay(EGL_DEFAULT_DISPLAY) with $DISPLAY set → X11 platform\n");
+        printf("     → GLVND routes to Mesa (handles NULL on X11) → Mesa has no DRI2 for nvidia.ko\n");
+        printf("     → Mesa falls back to llvmpipe, no error returned to the caller\n");
         printf("\n");
-        printf("FIX: RS3's SDL/EGL init should use eglGetPlatformDisplay with an explicit\n");
-        printf("     Wayland or device handle, not EGL_DEFAULT_DISPLAY. Or: ensure\n");
-        printf("     SDL_VIDEODRIVER is NOT forced to x11 so SDL uses the Wayland backend,\n");
-        printf("     which calls eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, wl_display).\n");
+        printf("FIX: Replace eglGetDisplay(EGL_DEFAULT_DISPLAY) with\n");
+        printf("     eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_display, NULL)\n");
+        printf("     where x11_display comes from SDL_GetWindowWMInfo (already available).\n");
+        printf("     With an explicit platform, GLVND routes by vendor priority and Nvidia wins.\n");
     } else if (result_default == 0) {
         printf("Default EGL already works on this system — bug may not be present.\n");
     } else {
@@ -305,6 +297,7 @@ int main(void) {
         printf("Ensure nvidia-open or nvidia driver package is fully installed.\n");
     }
 
-    dlclose(lib);
+    dlclose(x11_lib);
+    dlclose(egl_lib);
     return 0;
 }

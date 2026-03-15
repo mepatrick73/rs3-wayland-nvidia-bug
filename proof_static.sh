@@ -73,14 +73,30 @@ else
         | sed 's/^/    /'
 fi
 
-# ── Proof 2: eglGetPlatformDisplay never imported ─────────────────────────────
+# ── Proof 2: eglGetPlatformDisplay (core EGL 1.5) not a direct import ─────────
 echo ""
-echo "[PROOF 2] Checking for eglGetPlatformDisplay (core EGL 1.5) import..."
+echo "[PROOF 2] Checking for eglGetPlatformDisplay (core EGL 1.5) direct import..."
 if objdump -T "$RS2CLIENT" 2>/dev/null | grep -q "eglGetPlatformDisplay$"; then
-    echo "  FOUND — rs2client imports eglGetPlatformDisplay (unexpected)"
+    echo "  FOUND — rs2client imports eglGetPlatformDisplay directly"
 else
-    echo "  NOT FOUND — rs2client does NOT import eglGetPlatformDisplay"
-    echo "  The fix (eglGetPlatformDisplay with explicit platform) is unavailable to rs2client."
+    echo "  NOT FOUND — rs2client does NOT directly import eglGetPlatformDisplay (core EGL 1.5)"
+    echo "  However, the EXT variant may still be available via EGLEW — see PROOF 2b."
+fi
+
+# ── Proof 2b: eglGetPlatformDisplayEXT available via EGLEW ────────────────────
+echo ""
+echo "[PROOF 2b] Checking for EGLEW eglGetPlatformDisplayEXT dispatch table entries..."
+EGLEW_EXT=$(strings "$RS2CLIENT" | grep "eglewGetPlatformDisplayEXT")
+EGLEW_PROC=$(strings "$RS2CLIENT" | grep "^eglGetPlatformDisplayEXT$")
+if [[ -n "$EGLEW_EXT" ]]; then
+    echo "  FOUND: $EGLEW_EXT"
+    echo "  FOUND: ${EGLEW_PROC:-eglGetPlatformDisplayEXT (proc name)}"
+    echo "  → EGLEW dispatch table includes __eglewGetPlatformDisplayEXT."
+    echo "    The proc name string 'eglGetPlatformDisplayEXT' is used by EGLEW to load"
+    echo "    the function pointer via eglGetProcAddress at startup."
+    echo "    Option A fix (eglGetPlatformDisplayEXT) is available to rs2client."
+else
+    echo "  NOT FOUND — EGLEW does not include eglGetPlatformDisplayEXT"
 fi
 
 # ── Proof 3: SDL_GetWindowWMInfo is imported ──────────────────────────────────
