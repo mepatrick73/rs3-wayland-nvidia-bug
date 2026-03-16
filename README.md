@@ -38,7 +38,7 @@
 
 There are two options:
 
-### Option A — Pass explicit X11 display (minimal change)
+### Option A — Pass explicit X11 display
 
 Replace:
 ```c
@@ -49,7 +49,44 @@ with:
 // SDL_GetWindowWMInfo already provides x11_display — see Claim 4
 EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_display, NULL);
 ```
-With an explicit platform, GLVND routes by vendor priority: Nvidia (10) beats Mesa (50). `eglGetPlatformDisplayEXT` is the pre-EGL-1.5 extension variant (`EGL_EXT_platform_base`), distinct from the core EGL 1.5 `eglGetPlatformDisplay` — which is why Proof 2 shows the core variant absent while the EXT variant is still available. EGLEW loads it at startup via `eglGetProcAddress("eglGetPlatformDisplayEXT")` into the `__eglewGetPlatformDisplayEXT` dispatch table entry, confirmed by Proof 2b. **This is a one-line change.**
+With an explicit platform, GLVND routes by vendor priority: Nvidia (10) beats Mesa (50). `eglGetPlatformDisplayEXT` is the pre-EGL-1.5 extension variant (`EGL_EXT_platform_base`), distinct from the core EGL 1.5 `eglGetPlatformDisplay` — which is why Proof 2 shows the core variant absent while the EXT variant is still available. EGLEW loads it at startup via `eglGetProcAddress("eglGetPlatformDisplayEXT")` into the `__eglewGetPlatformDisplayEXT` dispatch table entry, confirmed by Proof 2b.
+
+> **Important:** this one-line change is sufficient if rs2client switches to offscreen (pbuffer) rendering. `poc_egl` Test 2 confirms this path works. However, rs2client currently uses `eglCreateWindowSurface` to render directly into the SDL game window. For that path, the one-line change alone is not enough — see the additional steps below.
+
+#### For window surface rendering (eglCreateWindowSurface)
+
+The EGL spec requires that an X11 window must be created with the **same visual** that the EGL config expects (`EGL_NATIVE_VISUAL_ID`). SDL picks its own visual when it creates the window, and it doesn't match Nvidia's EGL config — `eglCreateWindowSurface` returns `EGL_BAD_MATCH`. `poc_egl` Test 3 demonstrates the full working fix.
+
+The correct sequence:
+
+```c
+// 1. Open X display (needed before the SDL window exists)
+Display* x11_dpy = XOpenDisplay(NULL);
+
+// 2. Get the Nvidia EGL display
+EGLDisplay egl_dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_dpy, NULL);
+eglInitialize(egl_dpy, ...);
+
+// 3. Choose config and read the visual ID Nvidia requires
+EGLConfig cfg;
+eglChooseConfig(egl_dpy, attrs_with_EGL_WINDOW_BIT, &cfg, 1, &n);
+EGLint visual_id;
+eglGetConfigAttrib(egl_dpy, cfg, EGL_NATIVE_VISUAL_ID, &visual_id);
+
+// 4. Create an X11 window with that exact visual
+XVisualInfo tmpl = { .visualid = visual_id };
+XVisualInfo* vi = XGetVisualInfo(x11_dpy, VisualIDMask, &tmpl, &n);
+XCreateWindow(x11_dpy, root, ..., vi->depth, InputOutput, vi->visual, ...);
+XSync(x11_dpy, False); // flush before SDL's connection sees the XID
+
+// 5. Wrap the Xlib window in SDL so SDL handles events as normal
+SDL_Window* sdl_win = SDL_CreateWindowFrom((void*)xlib_window);
+
+// 6. Create the EGL surface — visual matches, succeeds
+EGLSurface surf = eglCreateWindowSurface(egl_dpy, cfg, xlib_window, NULL);
+```
+
+The visual matching requirement is specified in the EGL spec: *"for EGL window surfaces, a suitable native window with a matching native visual must be created first"* ([eglIntro](https://registry.khronos.org/EGL/sdk/docs/man/html/eglIntro.xhtml)). The `EGL_EXT_platform_x11` extension spec's example code uses exactly the `eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)` → `XGetVisualInfo` → `XCreateWindow` sequence as the way to create a compatible window before calling `eglCreatePlatformWindowSurfaceEXT` ([registry.khronos.org](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_platform_x11.txt)).
 
 ### Option B — Remove the X11 binding entirely (proper fix)
 
@@ -277,7 +314,7 @@ The same `poc_egl.c` then calls `eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, 
   GL renderer:   "llvmpipe (LLVM 21.1.8, 256 bits)"
 RESULT: SOFTWARE FALLBACK — llvmpipe (CPU, not GPU)
 
-=== TEST 2: eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT, x11_display) — Option A fix ===
+=== TEST 2: eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_EXT) + pbuffer ===
 
   eglGetPlatformDisplayEXT: OK
   eglInitialize: OK — EGL 1.5
